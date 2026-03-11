@@ -56,7 +56,7 @@ export default async function ErrorPage({ params }: { params: { slug: string } }
     try {
         const relatedSnapshot = await db.collection("errors").orderBy("createdAt", "desc").limit(5).get();
         relatedErrors = relatedSnapshot.docs
-            .map((doc) => ({ id: doc.id, ...doc.data() }))
+            .map((doc: any) => ({ id: doc.id, ...doc.data() }))
             .filter((err: any) => err.slug !== slug)
             .slice(0, 4);
     } catch (err) {

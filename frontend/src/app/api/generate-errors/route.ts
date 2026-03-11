@@ -1,155 +1,91 @@
-import { NextResponse } from 'next/server';
-import { initializeApp, getApps, cert } from 'firebase-admin/app';
-import { getFirestore } from 'firebase-admin/firestore';
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { NextResponse } from "next/server";
+import { db } from "../../../lib/firebase-admin";
+import { generateSolution } from "../../../lib/gemini";
+import { generateSlug } from "../../../lib/slugify";
+import { isValidErrorInput } from "../../../lib/validation";
+import { hashError } from "../../../lib/hashError";
 
 export const dynamic = "force-dynamic";
 
-// 1. Initialize Firebase Admin SDK using Environment Variables
-if (!getApps().length) {
-    if (!process.env.FIREBASE_PROJECT_ID || !process.env.FIREBASE_CLIENT_EMAIL || !process.env.FIREBASE_PRIVATE_KEY) {
-        console.error("Missing Firebase Environment Variables.");
-    } else {
-        initializeApp({
-            credential: cert({
-                projectId: process.env.FIREBASE_PROJECT_ID,
-                clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-                // Replace escaped newlines with actual newlines for the private key
-                privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-            }),
-        });
-        console.log('Firebase Admin Initialized from Environment Variables');
-    }
-}
-
-const db = getFirestore();
-
-// Utility to create delay between requests (for rate limiting)
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-// Utility to generate a slug from error title
-const generateSlug = (title: string) => {
-    return title
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, '-')
-        .replace(/(^-|-$)+/g, ''); // Remove leading and trailing hyphens
-};
 
 export async function POST(req: Request) {
     try {
-        // Ensure GEMINI_API_KEY is present
-        if (!process.env.GEMINI_API_KEY) {
-            return NextResponse.json({ success: false, error: 'GEMINI_API_KEY is missing in environment variables' }, { status: 500 });
+        // Enforce Security Check
+        if (req.headers.get("x-admin-secret") !== process.env.ADMIN_SECRET) {
+             return new Response("Unauthorized", { status: 401 });
         }
 
-        // 2. Parse errors from the Request Body instead of a local file
         const body = await req.json();
         const { errors } = body;
 
-        // Basic validation
+        // Validation for the Array
         if (!Array.isArray(errors) || errors.length === 0) {
             return NextResponse.json(
-                { success: false, error: 'Invalid input. Expected JSON body with an "errors" array. e.g. { "errors": [{ "title": "Error 1", "description": "Desc 1" }] }' },
+                { success: false, error: 'Invalid input. Expected {"errors": [{"title": "...", "description": "..."}]}' },
                 { status: 400 }
             );
         }
 
-        // 3. Initialize Google Gemini 1.5 Flash using Environment Variable
-        const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY.trim());
-        const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
-
         const results = [];
 
-        console.log(`Found ${errors.length} errors to process.\n`);
-
-        // 4. Process each error
         for (const data of errors) {
             const { title, description } = data;
 
-            if (!title) {
+            if (!title || !isValidErrorInput(title)) {
+                results.push({ title, status: "skipped", reason: "Invalid error input" });
                 continue;
             }
 
-            console.log(`🚀 Processing Error: ${title}`);
-
             try {
-                // Setup Gemini AI Prompt
-                const prompt = `
-You are an expert technical writer for ErrorWiki.com.
-I am providing an error title and its context. 
-Your task is to write a professional, 100% unique, and SEO-friendly article for this error.
+                // Duplicate check
+                const hash = hashError(title);
+                const existingDocs = await db.collection("errors").where("hash", "==", hash).limit(1).get();
 
-Error Title: "${title}"
-Context/Description: "${description || 'No description provided.'}"
-
-Article Requirements:
-- A clear heading: 'How to fix ${title}'
-- A 'What is it?' section explaining the cause.
-- A 'Step-by-step Solution' section using bullet points.
-- The tone must be authoritative and helpful for developers. Do not include conversational filler text.
-
-Respond ONLY with a raw JSON object and nothing else. The JSON must have exactly this structure:
-{
-  "errorCode": "Extract or infer an alphanumeric error code from the title/context (e.g. 404, HY000). Use 'N/A' if none can be found.",
-  "solution": "The fully formatted article content adhering to the required structure."
-}
-`;
-
-                // Hit Gemini API
-                const response = await model.generateContent(prompt);
-                let responseText = response.response.text();
-
-                // Clean up potentially wrapped markdown blocks from AI response
-                responseText = responseText.replace(/^```json\s*/i, '').replace(/\s*```$/i, '').trim();
-
-                let aiResult;
-                try {
-                    aiResult = JSON.parse(responseText);
-                } catch (err) {
-                    console.warn('⚠️ Failed to parse AI JSON response. Falling back to default extraction.');
-                    aiResult = {
-                        errorCode: 'N/A',
-                        solution: responseText
-                    };
+                if (!existingDocs.empty) {
+                    const existingData = existingDocs.docs[0].data();
+                    results.push({ title, status: 'success', id: existingDocs.docs[0].id, duplicate: true });
+                    continue;
                 }
 
-                // Prepare Firestore document data
+                // Generative AI Magic
+                const aiResult = await generateSolution(title, description);
+
                 const slug = generateSlug(title);
                 const docData = {
                     title: title,
                     errorCode: aiResult.errorCode || 'N/A',
-                    solution: aiResult.solution || responseText,
+                    explanation: aiResult.explanation || 'N/A',
+                    solution: aiResult.solution,
                     slug: slug,
+                    hash: hash,
                     createdAt: new Date(),
                 };
 
-                // Database Sync: Save to Firestore 'errors' collection
                 const docRef = db.collection('errors').doc();
                 await docRef.set(docData);
 
-                results.push({ title, status: 'success', id: docRef.id });
-                console.log(`✅ Passed: Saved "${title}" to Firestore with ID: ${docRef.id}`);
+                results.push({ title, status: 'success', id: docRef.id, duplicate: false });
 
-                // Rate Limiting: 3-second delay between each AI request
-                console.log('⏳ Waiting 3 seconds to respect rate limits...');
-                await delay(3000);
-
+                // Vercel friendly delay wait logic pattern to prevent Gemini limit crashes
+                await delay(2000); 
             } catch (error: any) {
-                console.error(`\n❌ Failed to process "${title}":`, error.message);
-                results.push({ title, status: 'error', error: error.message });
+                console.error(`Failed to process ${title}:`, error);
+                results.push({ title, status: 'error', error: "AI generation failed" });
             }
         }
 
-        // 5. Return JSON Success Response
-        return NextResponse.json({ 
-            success: true, 
-            message: 'Processing complete', 
+        return NextResponse.json({
+            success: true,
             processedCount: results.length,
-            results 
+            results
         });
 
-    } catch (error: any) {
-        console.error("Critical Route Error:", error);
-        return NextResponse.json({ success: false, error: 'Internal server error', details: error.message }, { status: 500 });
+    } catch (e: any) {
+        console.error("Critical Bulk Route Error:", e);
+        return NextResponse.json({
+            success: false,
+            error: "Internal server error"
+        }, { status: 500 });
     }
 }
