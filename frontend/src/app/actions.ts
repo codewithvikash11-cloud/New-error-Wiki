@@ -5,7 +5,7 @@ import { db } from "@/lib/firebase-admin";
 export async function searchErrorsAction(query: string) {
     try {
         const snapshot = await db.collection("errors").orderBy("createdAt", "desc").limit(100).get();
-        const all = snapshot.docs.map(doc => {
+        const all = snapshot.docs.map((doc: any) => {
             const data = doc.data();
             const createdAt = data.createdAt;
             return {
